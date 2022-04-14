@@ -42,3 +42,4 @@ build-*
 # ignore other build directory patterns
 *-gcc*
 *-clang*
+/compile_commands.json
