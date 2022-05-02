@@ -461,7 +461,7 @@ remove_xdp_program(struct pmd_internals *internals) {
 
     if (bpf_get_link_xdp_id(internals->if_index, &curr_prog_id,
                             XDP_FLAGS_UPDATE_IF_NOEXIST)) {
-        MINI_XDP_LOG(RTE_LOG_ERR, "bpf_get_link_xdp_id failed\n");
+        MINI_XDP_LOG(ERR, "bpf_get_link_xdp_id failed\n");
         return;
     }
     bpf_set_link_xdp_fd(internals->if_index, -1,
@@ -490,7 +490,7 @@ eth_dev_close(struct rte_eth_dev *dev) {
     if (rte_eal_process_type() != RTE_PROC_PRIMARY)
         return 0;
 
-    MINI_XDP_LOG(RTE_LOG_INFO,
+    MINI_XDP_LOG(INFO,
                  "Closing AF_XDP ethdev on numa socket %u\n",
                  rte_socket_id());
 
@@ -607,7 +607,7 @@ load_xdp_prog(struct pmd_internals *internals) {
 
     int ret = bpf_prog_load(internals->prog_path, BPF_PROG_TYPE_XDP, &obj, &internals->bpf_fd);
     if (ret) {
-        MINI_XDP_LOG(RTE_LOG_ERR,
+        MINI_XDP_LOG(ERR,
                      "Failed to load xdp program: %s\n", internals->prog_path);
         return ret;
     }
@@ -616,7 +616,7 @@ load_xdp_prog(struct pmd_internals *internals) {
     //  此map主要用于同步ARP记录
     internals->arp_cache_map = bpf_object__find_map_by_name(obj, "arp_cache_map");
     if (!internals->arp_cache_map) {
-        MINI_XDP_LOG(RTE_LOG_ERR,
+        MINI_XDP_LOG(ERR,
                      "Failed to find arp_cache_map in %s\n", internals->prog_path);
         return -1;
     }
@@ -625,7 +625,7 @@ load_xdp_prog(struct pmd_internals *internals) {
     //  此map主要用于IPv4重定向到xsk map
     internals->redirect_v4_map = bpf_object__find_map_by_name(obj, "redirect_v4_map");
     if (!internals->redirect_v4_map) {
-        MINI_XDP_LOG(RTE_LOG_ERR,
+        MINI_XDP_LOG(ERR,
                      "Failed to find redirect_v4_map in %s\n", internals->prog_path);
         return -1;
     }
@@ -633,7 +633,7 @@ load_xdp_prog(struct pmd_internals *internals) {
     // 加载 xsk_map
     internals->xsk_map = bpf_object__find_map_by_name(obj, "xsk_map");
     if (!internals->xsk_map) {
-        MINI_XDP_LOG(RTE_LOG_ERR,
+        MINI_XDP_LOG(ERR,
                      "Failed to find xsk_map in %s\n", internals->prog_path);
         return -1;
     }
@@ -642,75 +642,17 @@ load_xdp_prog(struct pmd_internals *internals) {
     ret = bpf_set_link_xdp_fd(internals->if_index, internals->bpf_fd,
                               XDP_FLAGS_UPDATE_IF_NOEXIST);
     if (ret) {
-        MINI_XDP_LOG(RTE_LOG_ERR,
+        MINI_XDP_LOG(ERR,
                      "Failed to set prog fd %d on interface\n", internals->bpf_fd);
         return -1;
     }
 
-    MINI_XDP_LOG(RTE_LOG_INFO,
+    MINI_XDP_LOG(INFO,
                  "Successfully loaded XDP program %s with fd %d\n",
                  internals->prog_path, internals->bpf_fd);
 
     return 0;
 };
-
-/* Detect support for busy polling through setsockopt(). */
-static int
-configure_preferred_busy_poll(struct pkt_rx_queue *rxq) {
-    int sock_opt = 1;
-    int fd = xsk_socket__fd(rxq->xsk);
-    int ret = 0;
-
-    ret = setsockopt(fd, SOL_SOCKET, SO_PREFER_BUSY_POLL,
-                     (void *) &sock_opt, sizeof(sock_opt));
-    if (ret < 0) {
-        AF_XDP_LOG(DEBUG, "Failed to set SO_PREFER_BUSY_POLL\n");
-        goto err_prefer;
-    }
-
-    sock_opt = ETH_AF_XDP_DFLT_BUSY_TIMEOUT;
-    ret = setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, (void *) &sock_opt,
-                     sizeof(sock_opt));
-    if (ret < 0) {
-        AF_XDP_LOG(DEBUG, "Failed to set SO_BUSY_POLL\n");
-        goto err_timeout;
-    }
-
-    sock_opt = rxq->busy_budget;
-    ret = setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL_BUDGET,
-                     (void *) &sock_opt, sizeof(sock_opt));
-    if (ret < 0) {
-        AF_XDP_LOG(DEBUG, "Failed to set SO_BUSY_POLL_BUDGET\n");
-    } else {
-        AF_XDP_LOG(INFO, "Busy polling budget set to: %u\n",
-                   rxq->busy_budget);
-        return 0;
-    }
-
-    /* setsockopt failure - attempt to restore xsk to default state and
-     * proceed without busy polling support.
-     */
-    sock_opt = 0;
-    ret = setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, (void *) &sock_opt,
-                     sizeof(sock_opt));
-    if (ret < 0) {
-        AF_XDP_LOG(ERR, "Failed to unset SO_BUSY_POLL\n");
-        return -1;
-    }
-
-    err_timeout:
-    sock_opt = 0;
-    ret = setsockopt(fd, SOL_SOCKET, SO_PREFER_BUSY_POLL,
-                     (void *) &sock_opt, sizeof(sock_opt));
-    if (ret < 0) {
-        AF_XDP_LOG(ERR, "Failed to unset SO_PREFER_BUSY_POLL\n");
-        return -1;
-    }
-
-    err_prefer:
-    rxq->busy_budget = 0;
-    return 0;
-}
 
 // 配置XDP xsk
 //  TODO: 看一下逻辑
@@ -1061,7 +1003,7 @@ static const char *const valid_arguments[] = {
 
 // 解析int
 static int
-_parse_integer_arg(const char *key __rte_unused,
+parse_integer_arg(const char *key __rte_unused,
                    const char *value, void *extra_args) {
     int *i = (int *) extra_args;
     char *end;
@@ -1077,7 +1019,7 @@ _parse_integer_arg(const char *key __rte_unused,
 
 // 解析接口名称
 static int
-_parse_name_arg(const char *key __rte_unused,
+parse_name_arg(const char *key __rte_unused,
                 const char *value, void *extra_args) {
     char *name = extra_args;
 
@@ -1094,7 +1036,7 @@ _parse_name_arg(const char *key __rte_unused,
 
 // 解析XDP内核程序位置
 static int
-_parse_prog_arg(const char *key __rte_unused,
+parse_prog_arg(const char *key __rte_unused,
                 const char *value, void *extra_args) {
     char *path = extra_args;
 
@@ -1121,11 +1063,11 @@ static int
 parse_parameters(struct rte_kvargs *kvlist, char *if_name, char *prog_path) {
     int ret;
 
-    ret = rte_kvargs_process(kvlist, ETH_MINI_XDP_IFACE_ARG, &_parse_name_arg, if_name);
+    ret = rte_kvargs_process(kvlist, ETH_MINI_XDP_IFACE_ARG, &parse_name_arg, if_name);
     if (ret < 0)
         goto free_kvlist;
 
-    ret = rte_kvargs_process(kvlist, ETH_MINI_XDP_PROG_ARG, &_parse_prog_arg, prog_path);
+    ret = rte_kvargs_process(kvlist, ETH_MINI_XDP_PROG_ARG, &parse_prog_arg, prog_path);
     if (ret < 0)
         goto free_kvlist;
 
@@ -1166,7 +1108,7 @@ init_internals(struct rte_vdev_device *dev, const char *if_name, const char *pro
     ret = xdp_get_channels_info(if_name, &max_queue_count, &combined_queue_count, &tx_queues, &rx_queues);
     // 如果不支持的话，则认为是单通道，可以正常运行
     if (ret == -EOPNOTSUPP) {
-        MINI_XDP_LOG(RTE_LOG_INFO, "Device not support channels: %s\n", if_name);
+        MINI_XDP_LOG(INFO, "Device not support channels: %s\n", if_name);
         tx_queues = 1;
         rx_queues = 1;
     } else if (ret) {
@@ -1178,7 +1120,7 @@ init_internals(struct rte_vdev_device *dev, const char *if_name, const char *pro
     if (tx_queues != 1 || rx_queues != 1) {
         ret = xdp_set_channels_info(if_name, 1, 1);
         if (ret) {
-            MINI_XDP_LOG(RTE_LOG_ERR, "Device can not set to valid queue count: %s\n", if_name);
+            MINI_XDP_LOG(ERR, "Device can not set to valid queue count: %s\n", if_name);
             goto err_free_internals;
         }
     }
@@ -1188,7 +1130,7 @@ init_internals(struct rte_vdev_device *dev, const char *if_name, const char *pro
                                               sizeof(struct pkt_rx_queue) * rx_queues,
                                               0, numa_node);
     if (internals->rx_queues == NULL) {
-        MINI_XDP_LOG(RTE_LOG_ERR,
+        MINI_XDP_LOG(ERR,
                      "Failed to allocate memory for rx queues.\n");
         goto err_free_internals;
     }
@@ -1198,7 +1140,7 @@ init_internals(struct rte_vdev_device *dev, const char *if_name, const char *pro
                                               sizeof(struct pkt_tx_queue) * tx_queues,
                                               0, numa_node);
     if (internals->tx_queues == NULL) {
-        MINI_XDP_LOG(RTE_LOG_ERR,
+        MINI_XDP_LOG(ERR,
                      "Failed to allocate memory for tx queues.\n");
         goto err_free_rx;
     }
@@ -1254,14 +1196,14 @@ rte_pmd_mini_xdp_probe(struct rte_vdev_device *dev) {
     struct rte_eth_dev *eth_dev = NULL;
     const char *name = rte_vdev_device_name(dev);
 
-    MINI_XDP_LOG(RTE_LOG_INFO,
+    MINI_XDP_LOG(INFO,
                  "Initializing pmd_mini_xdp for %s\n",
                  name);
 
     // 不允许启动第二个实例
     // miniXDP单队列，没有并行的意义
     if (rte_eal_process_type() == RTE_PROC_SECONDARY) {
-        MINI_XDP_LOG(RTE_LOG_ERR,
+        MINI_XDP_LOG(ERR,
                      "Failed to probe %s. MINI_XDP PMD does not support secondary processes.\n",
                      name);
         return -ENOTSUP;
@@ -1270,7 +1212,7 @@ rte_pmd_mini_xdp_probe(struct rte_vdev_device *dev) {
     // 解析参数
     kvlist = rte_kvargs_parse(rte_vdev_device_args(dev), valid_arguments);
     if (kvlist == NULL) {
-        MINI_XDP_LOG(RTE_LOG_ERR,
+        MINI_XDP_LOG(ERR,
                      "Invalid kvargs key\n");
         return -EINVAL;
     }
@@ -1281,13 +1223,13 @@ rte_pmd_mini_xdp_probe(struct rte_vdev_device *dev) {
 
     // 解析参数
     if (parse_parameters(kvlist, if_name, prog_path) < 0) {
-        MINI_XDP_LOG(RTE_LOG_ERR,
+        MINI_XDP_LOG(ERR,
                      "Invalid kvargs value\n");
         return -EINVAL;
     }
 
     if (strlen(if_name) == 0) {
-        MINI_XDP_LOG(RTE_LOG_ERR,
+        MINI_XDP_LOG(ERR,
                      "Network interface must be specified\n");
         return -EINVAL;
     }
@@ -1295,7 +1237,7 @@ rte_pmd_mini_xdp_probe(struct rte_vdev_device *dev) {
     // 生成vdev设备
     eth_dev = init_internals(dev, if_name, prog_path);
     if (eth_dev == NULL) {
-        MINI_XDP_LOG(RTE_LOG_ERR,
+        MINI_XDP_LOG(ERR,
                      "Failed to init device internals\n");
         return -1;
     }
