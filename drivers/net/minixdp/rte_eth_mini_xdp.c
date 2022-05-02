@@ -1,4 +1,28 @@
-#include "common.h"
+#include "header.h"
+
+struct pmd_internals {
+    int if_index;
+    char if_name[IFNAMSIZ];
+
+    // eBPF程序部分
+    // 程序二进制文件路径
+    char prog_path[PATH_MAX];
+    // 标记
+    bool custom_prog_configured;
+    // ebpf程序文件描述符
+    int bpf_fd;
+    // ARP缓存表
+    struct bpf_map *arp_cache_map;
+    // 重定向的IPv4路由表
+    struct bpf_map *redirect_v4_map;
+    // 重定向的队列
+    struct bpf_map *xsk_map;
+
+    struct rte_ether_addr eth_addr;
+
+    struct pkt_rx_queue *rx_queues;
+    struct pkt_tx_queue *tx_queues;
+};
 
 struct xsk_umem_info {
     struct xsk_umem *umem;
@@ -49,15 +73,6 @@ struct pkt_tx_queue {
     int xsk_queue_idx;
 };
 
-
-struct xuecloud_xdp_program {
-    int fd;
-    struct bpf_map **arp_cache_map;
-    struct bpf_map **redirect_v4_map;
-    struct bpf_map **xsk_map;
-};
-
-
 static const struct rte_eth_link pmd_link = {
         .link_speed = RTE_ETH_SPEED_NUM_10G,
         .link_duplex = RTE_ETH_LINK_FULL_DUPLEX,
@@ -65,68 +80,20 @@ static const struct rte_eth_link pmd_link = {
         .link_autoneg = RTE_ETH_LINK_AUTONEG
 };
 
-/* List which tracks PMDs to facilitate sharing UMEMs across them. */
-struct internal_list {
-    TAILQ_ENTRY(internal_list)
-    next;
-    struct rte_eth_dev *eth_dev;
-};
-
-TAILQ_HEAD(internal_list_head, internal_list
-);
-static struct internal_list_head internal_list =
-        TAILQ_HEAD_INITIALIZER(internal_list);
-
-static pthread_mutex_t internal_list_lock = PTHREAD_MUTEX_INITIALIZER;
-
-#if defined(XDP_UMEM_UNALIGNED_CHUNK_FLAG)
-
 static inline int
-reserve_fill_queue_zc(struct xsk_umem_info *umem, uint16_t reserve_size,
-                      struct rte_mbuf **bufs, struct xsk_ring_prod *fq) {
-    uint32_t idx;
-    uint16_t i;
-
-    if (unlikely(!xsk_ring_prod__reserve(fq, reserve_size, &idx))) {
-        for (i = 0; i < reserve_size; i++)
-            rte_pktmbuf_free(bufs[i]);
-        AF_XDP_LOG(DEBUG, "Failed to reserve enough fq descs.\n");
-        return -1;
-    }
-
-    for (i = 0; i < reserve_size; i++) {
-        __u64 *fq_addr;
-        uint64_t addr;
-
-        fq_addr = xsk_ring_prod__fill_addr(fq, idx++);
-        addr = (uint64_t) bufs[i] - (uint64_t) umem->buffer -
-               umem->mb_pool->header_size;
-        *fq_addr = addr;
-    }
-
-    xsk_ring_prod__submit(fq, reserve_size);
-
-    return 0;
-}
-
-#else
-
-static inline int
-reserve_fill_queue_cp(struct xsk_umem_info *umem, uint16_t reserve_size,
-                      struct rte_mbuf **bufs __rte_unused,
-                      struct xsk_ring_prod *fq) {
+reserve_fill_queue(struct xsk_umem_info *umem, uint16_t reserve_size,
+                   struct rte_mbuf **bufs __rte_unused, struct xsk_ring_prod *fq) {
     void *addrs[reserve_size];
     uint32_t idx;
     uint16_t i;
 
-    if (rte_ring_dequeue_bulk(umem->buf_ring, addrs, reserve_size, NULL)
-        != reserve_size) {
-        AF_XDP_LOG(DEBUG, "Failed to get enough buffers for fq.\n");
+    if (rte_ring_dequeue_bulk(umem->buf_ring, addrs, reserve_size, NULL) != reserve_size) {
+        MINI_XDP_LOG(DEBUG, "Failed to get enough buffers for fq.\n");
         return -1;
     }
 
     if (unlikely(!xsk_ring_prod__reserve(fq, reserve_size, &idx))) {
-        AF_XDP_LOG(DEBUG, "Failed to reserve enough fq descs.\n");
+        MINI_XDP_LOG(DEBUG, "Failed to reserve enough fq descs.\n");
         rte_ring_enqueue_bulk(umem->buf_ring, addrs,
                               reserve_size, NULL);
         return -1;
@@ -144,99 +111,8 @@ reserve_fill_queue_cp(struct xsk_umem_info *umem, uint16_t reserve_size,
     return 0;
 }
 
-#endif
-
-static inline int
-reserve_fill_queue(struct xsk_umem_info *umem, uint16_t reserve_size,
-                   struct rte_mbuf **bufs, struct xsk_ring_prod *fq) {
-#if defined(XDP_UMEM_UNALIGNED_CHUNK_FLAG)
-    return reserve_fill_queue_zc(umem, reserve_size, bufs, fq);
-#else
-    return reserve_fill_queue_cp(umem, reserve_size, bufs, fq);
-#endif
-}
-
-#if defined(XDP_UMEM_UNALIGNED_CHUNK_FLAG)
-
 static uint16_t
-af_xdp_rx_zc(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
-    struct pkt_rx_queue *rxq = queue;
-    struct xsk_ring_cons *rx = &rxq->rx;
-    struct xsk_ring_prod *fq = &rxq->fq;
-    struct xsk_umem_info *umem = rxq->umem;
-    uint32_t idx_rx = 0;
-    unsigned long rx_bytes = 0;
-    int i;
-    struct rte_mbuf *fq_bufs[ETH_AF_XDP_RX_BATCH_SIZE];
-
-    nb_pkts = xsk_ring_cons__peek(rx, nb_pkts, &idx_rx);
-
-    if (nb_pkts == 0) {
-        /* we can assume a kernel >= 5.11 is in use if busy polling is
-         * enabled and thus we can safely use the recvfrom() syscall
-         * which is only supported for AF_XDP sockets in kernels >=
-         * 5.11.
-         */
-        if (rxq->busy_budget) {
-            (void) recvfrom(xsk_socket__fd(rxq->xsk), NULL, 0,
-                            MSG_DONTWAIT, NULL, NULL);
-        } else if (xsk_ring_prod__needs_wakeup(fq)) {
-            (void) poll(&rxq->fds[0], 1, 1000);
-        }
-
-        return 0;
-    }
-
-    /* allocate bufs for fill queue replenishment after rx */
-    if (rte_pktmbuf_alloc_bulk(umem->mb_pool, fq_bufs, nb_pkts)) {
-        AF_XDP_LOG(DEBUG,
-                   "Failed to get enough buffers for fq.\n");
-        /* rollback cached_cons which is added by
-         * xsk_ring_cons__peek
-         */
-        rx->cached_cons -= nb_pkts;
-        return 0;
-    }
-
-    for (i = 0; i < nb_pkts; i++) {
-        const struct xdp_desc *desc;
-        uint64_t addr;
-        uint32_t len;
-        uint64_t offset;
-
-        desc = xsk_ring_cons__rx_desc(rx, idx_rx++);
-        addr = desc->addr;
-        len = desc->len;
-
-        offset = xsk_umem__extract_offset(addr);
-        addr = xsk_umem__extract_addr(addr);
-
-        bufs[i] = (struct rte_mbuf *)
-                xsk_umem__get_data(umem->buffer, addr +
-                                                 umem->mb_pool->header_size);
-        bufs[i]->data_off = offset - sizeof(struct rte_mbuf) -
-                            rte_pktmbuf_priv_size(umem->mb_pool) -
-                            umem->mb_pool->header_size;
-
-        rte_pktmbuf_pkt_len(bufs[i]) = len;
-        rte_pktmbuf_data_len(bufs[i]) = len;
-        rx_bytes += len;
-    }
-
-    xsk_ring_cons__release(rx, nb_pkts);
-    (void) reserve_fill_queue(umem, nb_pkts, fq_bufs, fq);
-
-    /* statistics */
-    rxq->stats.rx_pkts += nb_pkts;
-    rxq->stats.rx_bytes += rx_bytes;
-
-    return nb_pkts;
-}
-
-#else
-
-static uint16_t
-af_xdp_rx_cp(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
+af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
     struct pkt_rx_queue *rxq = queue;
     struct xsk_ring_cons *rx = &rxq->rx;
     struct xsk_umem_info *umem = rxq->umem;
@@ -296,17 +172,6 @@ af_xdp_rx_cp(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
     return nb_pkts;
 }
 
-#endif
-
-static uint16_t
-af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
-#if defined(XDP_UMEM_UNALIGNED_CHUNK_FLAG)
-    return af_xdp_rx_zc(queue, bufs, nb_pkts);
-#else
-    return af_xdp_rx_cp(queue, bufs, nb_pkts);
-#endif
-}
-
 static uint16_t
 eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
     uint16_t nb_rx;
@@ -333,7 +198,7 @@ eth_af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
 }
 
 static void
-pull_umem_cq(struct xsk_umem_info *umem, int size, struct xsk_ring_cons *cq) {
+pull_umem(struct xsk_umem_info *umem, int size, struct xsk_ring_cons *cq) {
     size_t i, n;
     uint32_t idx_cq = 0;
 
@@ -342,14 +207,7 @@ pull_umem_cq(struct xsk_umem_info *umem, int size, struct xsk_ring_cons *cq) {
     for (i = 0; i < n; i++) {
         uint64_t addr;
         addr = *xsk_ring_cons__comp_addr(cq, idx_cq++);
-#if defined(XDP_UMEM_UNALIGNED_CHUNK_FLAG)
-        addr = xsk_umem__extract_addr(addr);
-        rte_pktmbuf_free((struct rte_mbuf *)
-                                 xsk_umem__get_data(umem->buffer,
-                                                    addr + umem->mb_pool->header_size));
-#else
         rte_ring_enqueue(umem->buf_ring, (void *) addr);
-#endif
     }
 
     xsk_ring_cons__release(cq, n);
@@ -359,7 +217,7 @@ static void
 kick_tx(struct pkt_tx_queue *txq, struct xsk_ring_cons *cq) {
     struct xsk_umem_info *umem = txq->umem;
 
-    pull_umem_cq(umem, XSK_RING_CONS__DEFAULT_NUM_DESCS, cq);
+    pull_umem(umem, XSK_RING_CONS__DEFAULT_NUM_DESCS, cq);
 
     if (tx_syscall_needed(&txq->tx))
         while (send(xsk_socket__fd(txq->pair->xsk), NULL,
@@ -370,99 +228,14 @@ kick_tx(struct pkt_tx_queue *txq, struct xsk_ring_cons *cq) {
 
             /* pull from completion queue to leave more space */
             if (errno == EAGAIN)
-                pull_umem_cq(umem,
-                             XSK_RING_CONS__DEFAULT_NUM_DESCS,
-                             cq);
+                pull_umem(umem,
+                          XSK_RING_CONS__DEFAULT_NUM_DESCS,
+                          cq);
         }
 }
 
-#if defined(XDP_UMEM_UNALIGNED_CHUNK_FLAG)
-
 static uint16_t
-af_xdp_tx_zc(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
-    struct pkt_tx_queue *txq = queue;
-    struct xsk_umem_info *umem = txq->umem;
-    struct rte_mbuf *mbuf;
-    unsigned long tx_bytes = 0;
-    int i;
-    uint32_t idx_tx;
-    uint16_t count = 0;
-    struct xdp_desc *desc;
-    uint64_t addr, offset;
-    struct xsk_ring_cons *cq = &txq->pair->cq;
-    uint32_t free_thresh = cq->size >> 1;
-
-    if (xsk_cons_nb_avail(cq, free_thresh) >= free_thresh)
-        pull_umem_cq(umem, XSK_RING_CONS__DEFAULT_NUM_DESCS, cq);
-
-    for (i = 0; i < nb_pkts; i++) {
-        mbuf = bufs[i];
-
-        if (mbuf->pool == umem->mb_pool) {
-            if (!xsk_ring_prod__reserve(&txq->tx, 1, &idx_tx)) {
-                kick_tx(txq, cq);
-                if (!xsk_ring_prod__reserve(&txq->tx, 1,
-                                            &idx_tx))
-                    goto out;
-            }
-            desc = xsk_ring_prod__tx_desc(&txq->tx, idx_tx);
-            desc->len = mbuf->pkt_len;
-            addr = (uint64_t) mbuf - (uint64_t) umem->buffer -
-                   umem->mb_pool->header_size;
-            offset = rte_pktmbuf_mtod(mbuf, uint64_t) -
-                     (uint64_t) mbuf +
-                     umem->mb_pool->header_size;
-            offset = offset << XSK_UNALIGNED_BUF_OFFSET_SHIFT;
-            desc->addr = addr | offset;
-            count++;
-        } else {
-            struct rte_mbuf *local_mbuf =
-                    rte_pktmbuf_alloc(umem->mb_pool);
-            void *pkt;
-
-            if (local_mbuf == NULL)
-                goto out;
-
-            if (!xsk_ring_prod__reserve(&txq->tx, 1, &idx_tx)) {
-                rte_pktmbuf_free(local_mbuf);
-                goto out;
-            }
-
-            desc = xsk_ring_prod__tx_desc(&txq->tx, idx_tx);
-            desc->len = mbuf->pkt_len;
-
-            addr = (uint64_t) local_mbuf - (uint64_t) umem->buffer -
-                   umem->mb_pool->header_size;
-            offset = rte_pktmbuf_mtod(local_mbuf, uint64_t) -
-                     (uint64_t) local_mbuf +
-                     umem->mb_pool->header_size;
-            pkt = xsk_umem__get_data(umem->buffer, addr + offset);
-            offset = offset << XSK_UNALIGNED_BUF_OFFSET_SHIFT;
-            desc->addr = addr | offset;
-            rte_memcpy(pkt, rte_pktmbuf_mtod(mbuf, void *),
-                       desc->len);
-            rte_pktmbuf_free(mbuf);
-            count++;
-        }
-
-        tx_bytes += mbuf->pkt_len;
-    }
-
-    out:
-    xsk_ring_prod__submit(&txq->tx, count);
-    kick_tx(txq, cq);
-
-    txq->stats.tx_pkts += count;
-    txq->stats.tx_bytes += tx_bytes;
-    txq->stats.tx_dropped += nb_pkts - count;
-
-    return count;
-}
-
-#else
-
-static uint16_t
-af_xdp_tx_cp(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
+af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
     struct pkt_tx_queue *txq = queue;
     struct xsk_umem_info *umem = txq->umem;
     struct rte_mbuf *mbuf;
@@ -472,7 +245,7 @@ af_xdp_tx_cp(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
     uint32_t idx_tx;
     struct xsk_ring_cons *cq = &txq->pair->cq;
 
-    pull_umem_cq(umem, nb_pkts, cq);
+    pull_umem(umem, nb_pkts, cq);
 
     nb_pkts = rte_ring_dequeue_bulk(umem->buf_ring, addrs,
                                     nb_pkts, NULL);
@@ -513,11 +286,11 @@ af_xdp_tx_cp(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
 }
 
 static uint16_t
-af_xdp_tx_cp_batch(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
+af_xdp_tx_batch(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
     uint16_t nb_tx;
 
     if (likely(nb_pkts <= ETH_AF_XDP_TX_BATCH_SIZE))
-        return af_xdp_tx_cp(queue, bufs, nb_pkts);
+        return af_xdp_tx(queue, bufs, nb_pkts);
 
     nb_tx = 0;
     while (nb_pkts) {
@@ -527,7 +300,7 @@ af_xdp_tx_cp_batch(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
          * ETH_AF_XDP_TX_BATCH_SIZE or less.
          */
         n = (uint16_t) RTE_MIN(nb_pkts, ETH_AF_XDP_TX_BATCH_SIZE);
-        ret = af_xdp_tx_cp(queue, &bufs[nb_tx], n);
+        ret = af_xdp_tx(queue, &bufs[nb_tx], n);
         nb_tx = (uint16_t)(nb_tx + ret);
         nb_pkts = (uint16_t)(nb_pkts - ret);
         if (ret < n)
@@ -537,17 +310,12 @@ af_xdp_tx_cp_batch(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
     return nb_tx;
 }
 
-#endif
-
 static uint16_t
 eth_af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
-#if defined(XDP_UMEM_UNALIGNED_CHUNK_FLAG)
-    return af_xdp_tx_zc(queue, bufs, nb_pkts);
-#else
-    return af_xdp_tx_cp_batch(queue, bufs, nb_pkts);
-#endif
+    return af_xdp_tx_batch(queue, bufs, nb_pkts);
 }
 
+// vdev的ops，设置接口打开
 static int
 eth_dev_start(struct rte_eth_dev *dev) {
     dev->data->dev_link.link_status = RTE_ETH_LINK_UP;
@@ -555,103 +323,15 @@ eth_dev_start(struct rte_eth_dev *dev) {
     return 0;
 }
 
-/* This function gets called when the current port gets stopped. */
+// vdev的ops，设置接口关闭
 static int
 eth_dev_stop(struct rte_eth_dev *dev) {
     dev->data->dev_link.link_status = RTE_ETH_LINK_DOWN;
+
     return 0;
 }
 
-/* Find ethdev in list */
-static inline struct internal_list *
-find_internal_resource(struct pmd_internals *port_int) {
-    int found = 0;
-    struct internal_list *list = NULL;
-
-    if (port_int == NULL)
-        return NULL;
-
-    pthread_mutex_lock(&internal_list_lock);
-
-    TAILQ_FOREACH(list, &internal_list, next)
-    {
-        struct pmd_internals *list_int =
-                list->eth_dev->data->dev_private;
-        if (list_int == port_int) {
-            found = 1;
-            break;
-        }
-    }
-
-    pthread_mutex_unlock(&internal_list_lock);
-
-    if (!found)
-        return NULL;
-
-    return list;
-}
-
-/* Check if the netdev,qid context already exists */
-static inline bool
-
-ctx_exists(struct pkt_rx_queue *rxq, const char *ifname,
-           struct pkt_rx_queue *list_rxq, const char *list_ifname) {
-    bool exists = false;
-
-    if (rxq->xsk_queue_idx == list_rxq->xsk_queue_idx &&
-        !strncmp(ifname, list_ifname, IFNAMSIZ)) {
-        AF_XDP_LOG(ERR, "ctx %s,%i already exists, cannot share umem\n",
-                   ifname, rxq->xsk_queue_idx);
-        exists = true;
-    }
-
-    return exists;
-}
-
-/* Get a pointer to an existing UMEM which overlays the rxq's mb_pool */
-static inline int
-get_shared_umem(struct pkt_rx_queue *rxq, const char *ifname,
-                struct xsk_umem_info **umem) {
-    struct internal_list *list;
-    struct pmd_internals *internals;
-    int i = 0, ret = 0;
-    struct rte_mempool *mb_pool = rxq->mb_pool;
-
-    if (mb_pool == NULL)
-        return ret;
-
-    pthread_mutex_lock(&internal_list_lock);
-
-    TAILQ_FOREACH(list, &internal_list, next)
-    {
-        internals = list->eth_dev->data->dev_private;
-        for (i = 0; i < internals->queue_cnt; i++) {
-            struct pkt_rx_queue *list_rxq =
-                    &internals->rx_queues[i];
-            if (rxq == list_rxq)
-                continue;
-            if (mb_pool == internals->rx_queues[i].mb_pool) {
-                if (ctx_exists(rxq, ifname, list_rxq,
-                               internals->if_name)) {
-                    ret = -1;
-                    goto out;
-                }
-                if (__atomic_load_n(
-                        &internals->rx_queues[i].umem->refcnt,
-                        __ATOMIC_ACQUIRE)) {
-                    *umem = internals->rx_queues[i].umem;
-                    goto out;
-                }
-            }
-        }
-    }
-
-    out:
-    pthread_mutex_unlock(&internal_list_lock);
-
-    return ret;
-}
-
+// 接口配置
 static int
 eth_dev_configure(struct rte_eth_dev *dev) {
     struct pmd_internals *internal = dev->data->dev_private;
@@ -659,26 +339,6 @@ eth_dev_configure(struct rte_eth_dev *dev) {
     /* rx/tx must be paired */
     if (dev->data->nb_rx_queues != dev->data->nb_tx_queues)
         return -EINVAL;
-
-    if (internal->shared_umem) {
-        struct internal_list *list = NULL;
-        const char *name = dev->device->name;
-
-        /* Ensure PMD is not already inserted into the list */
-        list = find_internal_resource(internal);
-        if (list)
-            return 0;
-
-        list = rte_zmalloc_socket(name, sizeof(*list), 0,
-                                  dev->device->numa_node);
-        if (list == NULL)
-            return -1;
-
-        list->eth_dev = dev;
-        pthread_mutex_lock(&internal_list_lock);
-        TAILQ_INSERT_TAIL(&internal_list, list, next);
-        pthread_mutex_unlock(&internal_list_lock);
-    }
 
     return 0;
 }
@@ -715,28 +375,28 @@ eth_get_monitor_addr(void *rx_queue, struct rte_power_monitor_cond *pmc) {
     return 0;
 }
 
+// 获取接口信息
 static int
 eth_dev_info(struct rte_eth_dev *dev, struct rte_eth_dev_info *dev_info) {
     struct pmd_internals *internals = dev->data->dev_private;
 
     dev_info->if_index = internals->if_index;
     dev_info->max_mac_addrs = 1;
-    dev_info->max_rx_queues = internals->queue_cnt;
-    dev_info->max_tx_queues = internals->queue_cnt;
+
+    // 队列只支持一个，因此全部设置为1即可
+    dev_info->max_rx_queues = 1;
+    dev_info->max_tx_queues = 1;
 
     dev_info->min_mtu = RTE_ETHER_MIN_MTU;
-#if defined(XDP_UMEM_UNALIGNED_CHUNK_FLAG)
-    dev_info->max_rx_pktlen = getpagesize() -
-                              sizeof(struct rte_mempool_objhdr) -
-                              sizeof(struct rte_mbuf) -
-                              RTE_PKTMBUF_HEADROOM - XDP_PACKET_HEADROOM;
-#else
     dev_info->max_rx_pktlen = ETH_AF_XDP_FRAME_SIZE - XDP_PACKET_HEADROOM;
-#endif
-    dev_info->max_mtu = dev_info->max_rx_pktlen - ETH_AF_XDP_ETH_OVERHEAD;
+    // dev_info获取的最大MTU限制为1500，以免公网传输过程中产生太多分片
+    dev_info->max_mtu = ((dev_info->max_rx_pktlen - ETH_AF_XDP_ETH_OVERHEAD) > 1500) ?
+                        1500 : (dev_info->max_rx_pktlen - ETH_AF_XDP_ETH_OVERHEAD);
 
-    dev_info->default_rxportconf.burst_size = ETH_AF_XDP_DFLT_BUSY_BUDGET;
-    dev_info->default_txportconf.burst_size = ETH_AF_XDP_DFLT_BUSY_BUDGET;
+    // 突发模式把队列缩小
+    dev_info->default_rxportconf.burst_size = ETH_MINI_XDP_DFLT_BURST_SIZE;
+    dev_info->default_txportconf.burst_size = ETH_MINI_XDP_DFLT_BURST_SIZE;
+
     dev_info->default_rxportconf.nb_queues = 1;
     dev_info->default_txportconf.nb_queues = 1;
     dev_info->default_rxportconf.ring_size = ETH_AF_XDP_DFLT_NUM_DESCS;
@@ -771,7 +431,7 @@ eth_stats_get(struct rte_eth_dev *dev, struct rte_eth_stats *stats) {
         ret = getsockopt(xsk_socket__fd(rxq->xsk), SOL_XDP,
                          XDP_STATISTICS, &xdp_stats, &optlen);
         if (ret != 0) {
-            AF_XDP_LOG(ERR, "getsockopt() failed for XDP_STATISTICS.\n");
+            MINI_XDP_LOG(ERR, "getsockopt() failed for XDP_STATISTICS.\n");
             return -1;
         }
         stats->imissed += xdp_stats.rx_dropped;
@@ -783,28 +443,25 @@ eth_stats_get(struct rte_eth_dev *dev, struct rte_eth_stats *stats) {
     return 0;
 }
 
+// 重置接口收发包计数器
 static int
 eth_stats_reset(struct rte_eth_dev *dev) {
     struct pmd_internals *internals = dev->data->dev_private;
-    int i;
 
-    for (i = 0; i < internals->queue_cnt; i++) {
-        memset(&internals->rx_queues[i].stats, 0,
-               sizeof(struct rx_stats));
-        memset(&internals->tx_queues[i].stats, 0,
-               sizeof(struct tx_stats));
-    }
+    memset(&internals->rx_queues[0].stats, 0, sizeof(struct rx_stats));
+    memset(&internals->tx_queues[0].stats, 0, sizeof(struct tx_stats));
 
     return 0;
 }
 
+// 卸载xdp程序
 static void
 remove_xdp_program(struct pmd_internals *internals) {
     uint32_t curr_prog_id = 0;
 
     if (bpf_get_link_xdp_id(internals->if_index, &curr_prog_id,
                             XDP_FLAGS_UPDATE_IF_NOEXIST)) {
-        AF_XDP_LOG(ERR, "bpf_get_link_xdp_id failed\n");
+        MINI_XDP_LOG(RTE_LOG_ERR, "bpf_get_link_xdp_id failed\n");
         return;
     }
     bpf_set_link_xdp_fd(internals->if_index, -1,
@@ -813,68 +470,55 @@ remove_xdp_program(struct pmd_internals *internals) {
 
 static void
 xdp_umem_destroy(struct xsk_umem_info *umem) {
-#if defined(XDP_UMEM_UNALIGNED_CHUNK_FLAG)
-    umem->mb_pool = NULL;
-#else
     rte_memzone_free(umem->mz);
     umem->mz = NULL;
 
     rte_ring_free(umem->buf_ring);
     umem->buf_ring = NULL;
-#endif
 
     rte_free(umem);
 }
 
+// 关闭vdev接口
 static int
 eth_dev_close(struct rte_eth_dev *dev) {
     struct pmd_internals *internals = dev->data->dev_private;
     struct pkt_rx_queue *rxq;
     int i;
 
+    // 只处理主线程，因为不会有第二个，因此其他线程的就不再处理
     if (rte_eal_process_type() != RTE_PROC_PRIMARY)
         return 0;
 
-    AF_XDP_LOG(INFO, "Closing AF_XDP ethdev on numa socket %u\n",
-               rte_socket_id());
+    MINI_XDP_LOG(RTE_LOG_INFO,
+                 "Closing AF_XDP ethdev on numa socket %u\n",
+                 rte_socket_id());
 
-    for (i = 0; i < internals->queue_cnt; i++) {
-        rxq = &internals->rx_queues[i];
-        if (rxq->umem == NULL)
-            break;
-        xsk_socket__delete(rxq->xsk);
-
-        if (__atomic_sub_fetch(&rxq->umem->refcnt, 1, __ATOMIC_ACQUIRE)
-            == 0) {
-            (void) xsk_umem__delete(rxq->umem->umem);
-            xdp_umem_destroy(rxq->umem);
-        }
-
-        /* free pkt_tx_queue */
-        rte_free(rxq->pair);
-        rte_free(rxq);
+    // 只有一个队列，因此下边只需要关第一个队列即可
+    rxq = &internals->rx_queues[0];
+    if (rxq->umem == NULL)
+        goto clean_mac;
+    xsk_socket__delete(rxq->xsk);
+    if (__atomic_sub_fetch(&rxq->umem->refcnt, 1, __ATOMIC_ACQUIRE) == 0) {
+        (void) xsk_umem__delete(rxq->umem->umem);
+        xdp_umem_destroy(rxq->umem);
     }
 
+    /* free pkt_tx_queue */
+    rte_free(rxq->pair);
+    rte_free(rxq);
+
+    clean_mac:
     /*
      * MAC is not allocated dynamically, setting it to NULL would prevent
      * from releasing it in rte_eth_dev_release_port.
      */
     dev->data->mac_addrs = NULL;
 
+    // 移除接口绑定的XDP程序
     remove_xdp_program(internals);
 
-    if (internals->shared_umem) {
-        struct internal_list *list;
-
-        /* Remove ethdev from list used to track and share UMEMs */
-        list = find_internal_resource(internals);
-        if (list) {
-            pthread_mutex_lock(&internal_list_lock);
-            TAILQ_REMOVE(&internal_list, list, next);
-            pthread_mutex_unlock(&internal_list_lock);
-            rte_free(list);
-        }
-    }
+    // 没有开启共享的UMEM，所以不再进行原本代码中的shared UMEM操作
 
     return 0;
 }
@@ -885,91 +529,11 @@ eth_link_update(struct rte_eth_dev *dev __rte_unused,
     return 0;
 }
 
-#if defined(XDP_UMEM_UNALIGNED_CHUNK_FLAG)
-
-static inline uintptr_t get_base_addr(struct rte_mempool *mp, uint64_t *align) {
-    struct rte_mempool_memhdr *memhdr;
-    uintptr_t memhdr_addr, aligned_addr;
-
-    memhdr = STAILQ_FIRST(&mp->mem_list);
-    memhdr_addr = (uintptr_t) memhdr->addr;
-    aligned_addr = memhdr_addr & ~(getpagesize() - 1);
-    *align = memhdr_addr - aligned_addr;
-
-    return aligned_addr;
-}
-
-static struct
-        xsk_umem_info *xdp_umem_configure(struct pmd_internals *internals,
-                                          struct pkt_rx_queue *rxq) {
-    struct xsk_umem_info *umem = NULL;
-    int ret;
-    struct xsk_umem_config usr_config = {
-            .fill_size = ETH_AF_XDP_DFLT_NUM_DESCS * 2,
-            .comp_size = ETH_AF_XDP_DFLT_NUM_DESCS,
-            .flags = XDP_UMEM_UNALIGNED_CHUNK_FLAG};
-    void *base_addr = NULL;
-    struct rte_mempool *mb_pool = rxq->mb_pool;
-    uint64_t umem_size, align = 0;
-
-    if (internals->shared_umem) {
-        if (get_shared_umem(rxq, internals->if_name, &umem) < 0)
-            return NULL;
-
-        if (umem != NULL &&
-            __atomic_load_n(&umem->refcnt, __ATOMIC_ACQUIRE) <
-            umem->max_xsks) {
-            AF_XDP_LOG(INFO, "%s,qid%i sharing UMEM\n",
-                       internals->if_name, rxq->xsk_queue_idx);
-            __atomic_fetch_add(&umem->refcnt, 1, __ATOMIC_ACQUIRE);
-        }
-    }
-
-    if (umem == NULL) {
-        usr_config.frame_size =
-                rte_mempool_calc_obj_size(mb_pool->elt_size,
-                                          mb_pool->flags, NULL);
-        usr_config.frame_headroom = mb_pool->header_size +
-                                    sizeof(struct rte_mbuf) +
-                                    rte_pktmbuf_priv_size(mb_pool) +
-                                    RTE_PKTMBUF_HEADROOM;
-
-        umem = rte_zmalloc_socket("umem", sizeof(*umem), 0,
-                                  rte_socket_id());
-        if (umem == NULL) {
-            AF_XDP_LOG(ERR, "Failed to allocate umem info");
-            return NULL;
-        }
-
-        umem->mb_pool = mb_pool;
-        base_addr = (void *) get_base_addr(mb_pool, &align);
-        umem_size = (uint64_t) mb_pool->populated_size *
-                    (uint64_t) usr_config.frame_size +
-                    align;
-
-        ret = xsk_umem__create(&umem->umem, base_addr, umem_size,
-                               &rxq->fq, &rxq->cq, &usr_config);
-        if (ret) {
-            AF_XDP_LOG(ERR, "Failed to create umem");
-            goto err;
-        }
-        umem->buffer = base_addr;
-
-        if (internals->shared_umem) {
-            umem->max_xsks = mb_pool->populated_size /
-                             ETH_AF_XDP_NUM_BUFFERS;
-            AF_XDP_LOG(INFO, "Max xsks for UMEM %s: %u\n",
-                       mb_pool->name, umem->max_xsks);
-        }
-
-        __atomic_store_n(&umem->refcnt, 1, __ATOMIC_RELEASE);
-    }
-
-#else
-
-static struct
-        xsk_umem_info *xdp_umem_configure(struct pmd_internals *internals,
-                                          struct pkt_rx_queue *rxq) {
+// UMEM配置
+//  去掉了原版的XDP_UMEM_UNALIGNED_CHUNK_FLAG支持
+//  TODO: 研究一下内存结构
+static struct xsk_umem_info *
+xdp_umem_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq) {
     struct xsk_umem_info *umem;
     const struct rte_memzone *mz;
     struct xsk_umem_config usr_config = {
@@ -982,35 +546,37 @@ static struct
     int ret;
     uint64_t i;
 
-    umem = rte_zmalloc_socket("umem", sizeof(*umem), 0, rte_socket_id());
+    umem = rte_zmalloc_socket("umem", sizeof(struct xsk_umem_info), 0, rte_socket_id());
     if (umem == NULL) {
-        AF_XDP_LOG(ERR, "Failed to allocate umem info");
+        MINI_XDP_LOG(ERR, "Failed to allocate umem info");
         return NULL;
     }
 
-    snprintf(ring_name, sizeof(ring_name), "af_xdp_ring_%s_%u",
+    // 创建ringbuff
+    snprintf(ring_name, sizeof(ring_name), "mini_xdp_ring_%s_%u",
              internals->if_name, rxq->xsk_queue_idx);
     umem->buf_ring = rte_ring_create(ring_name,
                                      ETH_AF_XDP_NUM_BUFFERS,
                                      rte_socket_id(),
                                      0x0);
     if (umem->buf_ring == NULL) {
-        AF_XDP_LOG(ERR, "Failed to create rte_ring\n");
+        MINI_XDP_LOG(ERR, "Failed to create rte_ring\n");
         goto err;
     }
 
+    // 入队
     for (i = 0; i < ETH_AF_XDP_NUM_BUFFERS; i++)
         rte_ring_enqueue(umem->buf_ring,
                          (void *) (i * ETH_AF_XDP_FRAME_SIZE));
 
-    snprintf(mz_name, sizeof(mz_name), "af_xdp_umem_%s_%u",
+    snprintf(mz_name, sizeof(mz_name), "mini_xdp_umem_%s_%u",
              internals->if_name, rxq->xsk_queue_idx);
     mz = rte_memzone_reserve_aligned(mz_name,
                                      ETH_AF_XDP_NUM_BUFFERS * ETH_AF_XDP_FRAME_SIZE,
                                      rte_socket_id(), RTE_MEMZONE_IOVA_CONTIG,
                                      getpagesize());
     if (mz == NULL) {
-        AF_XDP_LOG(ERR, "Failed to reserve memzone for af_xdp umem.\n");
+        MINI_XDP_LOG(ERR, "Failed to reserve memzone for umem.\n");
         goto err;
     }
 
@@ -1020,12 +586,11 @@ static struct
                            &usr_config);
 
     if (ret) {
-        AF_XDP_LOG(ERR, "Failed to create umem");
+        MINI_XDP_LOG(ERR, "Failed to create umem");
         goto err;
     }
     umem->mz = mz;
 
-#endif
     return umem;
 
     err:
@@ -1037,54 +602,54 @@ static struct
  * 加载eBPF XDP程序
  */
 static int
-load_xuecloud_xdp_prog(const char *prog_path, struct xuecloud_xdp_program *prog) {
+load_xdp_prog(struct pmd_internals *internals) {
     struct bpf_object *obj;
 
-    int ret = bpf_prog_load(prog_path, BPF_PROG_TYPE_XDP, &obj, &prog->fd);
+    int ret = bpf_prog_load(internals->prog_path, BPF_PROG_TYPE_XDP, &obj, &internals->bpf_fd);
     if (ret) {
-        AF_XDP_LOG(ERR, "Failed to load xuecloud xdp program %s\n", prog_path);
+        MINI_XDP_LOG(RTE_LOG_ERR,
+                     "Failed to load xdp program: %s\n", internals->prog_path);
         return ret;
     }
 
     // 加载 arp_cache_map
-    *prog->arp_cache_map = bpf_object__find_map_by_name(obj, "arp_cache_map");
-    if (!*prog->arp_cache_map) {
-        AF_XDP_LOG(ERR, "Failed to find arp_cache_map in %s\n", prog_path);
+    //  此map主要用于同步ARP记录
+    internals->arp_cache_map = bpf_object__find_map_by_name(obj, "arp_cache_map");
+    if (!internals->arp_cache_map) {
+        MINI_XDP_LOG(RTE_LOG_ERR,
+                     "Failed to find arp_cache_map in %s\n", internals->prog_path);
         return -1;
     }
 
     // 加载 redirect_v4_map
-    *prog->redirect_v4_map = bpf_object__find_map_by_name(obj, "redirect_v4_map");
-    if (!*prog->redirect_v4_map) {
-        AF_XDP_LOG(ERR, "Failed to find redirect_v4_map in %s\n", prog_path);
+    //  此map主要用于IPv4重定向到xsk map
+    internals->redirect_v4_map = bpf_object__find_map_by_name(obj, "redirect_v4_map");
+    if (!internals->redirect_v4_map) {
+        MINI_XDP_LOG(RTE_LOG_ERR,
+                     "Failed to find redirect_v4_map in %s\n", internals->prog_path);
         return -1;
     }
 
     // 加载 xsk_map
-    *prog->xsk_map = bpf_object__find_map_by_name(obj, "xsk_map");
-    if (!*prog->xsk_map) {
-        AF_XDP_LOG(ERR, "Failed to find xsk_map in %s\n", prog_path);
+    internals->xsk_map = bpf_object__find_map_by_name(obj, "xsk_map");
+    if (!internals->xsk_map) {
+        MINI_XDP_LOG(RTE_LOG_ERR,
+                     "Failed to find xsk_map in %s\n", internals->prog_path);
         return -1;
     }
 
-    AF_XDP_LOG(INFO, "Successfully loaded XDP program %s with fd %d\n",
-               prog_path, prog->fd);
-
-    return 0;
-};
-
-/*
- * attach eBPF XDP程序到网卡
- */
-static int
-attach_prog(const struct xuecloud_xdp_program *prog, int if_index) {
-    int ret = bpf_set_link_xdp_fd(if_index, prog->fd,
-                                  XDP_FLAGS_UPDATE_IF_NOEXIST);
+    // 把XDP程序加载到接口
+    ret = bpf_set_link_xdp_fd(internals->if_index, internals->bpf_fd,
+                              XDP_FLAGS_UPDATE_IF_NOEXIST);
     if (ret) {
-        AF_XDP_LOG(ERR, "Failed to set prog fd %d on interface %d\n",
-                   prog->fd, if_index);
+        MINI_XDP_LOG(RTE_LOG_ERR,
+                     "Failed to set prog fd %d on interface\n", internals->bpf_fd);
         return -1;
     }
+
+    MINI_XDP_LOG(RTE_LOG_INFO,
+                 "Successfully loaded XDP program %s with fd %d\n",
+                 internals->prog_path, internals->bpf_fd);
 
     return 0;
 };
@@ -1147,9 +712,10 @@ configure_preferred_busy_poll(struct pkt_rx_queue *rxq) {
     return 0;
 }
 
+// 配置XDP xsk
+//  TODO: 看一下逻辑
 static int
-xsk_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq,
-              int ring_size) {
+xsk_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq, int ring_size) {
     struct xsk_socket_config cfg;
     struct pkt_tx_queue *txq = rxq->pair;
     int ret = 0;
@@ -1168,62 +734,40 @@ xsk_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq,
     cfg.bind_flags = 0;
 
 #if defined(XDP_USE_NEED_WAKEUP)
+    // 保留此flag
     cfg.bind_flags |= XDP_USE_NEED_WAKEUP;
 #endif
 
-    if (strnlen(internals->prog_path, PATH_MAX) &&
-        !internals->custom_prog_configured) {
-        ret = load_xuecloud_xdp_prog(internals->prog_path,
-                                     internals->if_index,
-                                     &internals->map);
+    if (strnlen(internals->prog_path, PATH_MAX) && !internals->custom_prog_configured) {
+        // 加载XDP程序和其内部的map
+        ret = load_xdp_prog(internals);
         if (ret) {
-            AF_XDP_LOG(ERR, "Failed to load custom XDP program %s\n",
-                       internals->prog_path);
+            MINI_XDP_LOG(ERR, "Failed to load XDP program %s\n",
+                         internals->prog_path);
             goto err;
         }
+
         internals->custom_prog_configured = 1;
         cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
     }
 
-    if (internals->shared_umem)
-        ret = create_shared_socket(&rxq->xsk, internals->if_name,
-                                   rxq->xsk_queue_idx, rxq->umem->umem, &rxq->rx,
-                                   &txq->tx, &rxq->fq, &rxq->cq, &cfg);
-    else
-        ret = xsk_socket__create(&rxq->xsk, internals->if_name,
-                                 rxq->xsk_queue_idx, rxq->umem->umem, &rxq->rx,
-                                 &txq->tx, &cfg);
-
+    ret = xsk_socket__create(&rxq->xsk, internals->if_name,
+                             rxq->xsk_queue_idx, rxq->umem->umem, &rxq->rx,
+                             &txq->tx, &cfg);
     if (ret) {
-        AF_XDP_LOG(ERR, "Failed to create xsk socket.\n");
+        MINI_XDP_LOG(ERR, "Failed to create xsk socket.\n");
         goto err;
     }
 
-    /* insert the xsk into the xsks_map */
+    /* insert the xsk into the xsk_map */
     if (internals->custom_prog_configured) {
         int err, fd;
 
         fd = xsk_socket__fd(rxq->xsk);
-        err = bpf_map_update_elem(bpf_map__fd(internals->map),
+        err = bpf_map_update_elem(bpf_map__fd(internals->xsk_map),
                                   &rxq->xsk_queue_idx, &fd, 0);
         if (err) {
-            AF_XDP_LOG(ERR, "Failed to insert xsk in map.\n");
-            goto err;
-        }
-    }
-
-#if defined(XDP_UMEM_UNALIGNED_CHUNK_FLAG)
-    ret = rte_pktmbuf_alloc_bulk(rxq->umem->mb_pool, fq_bufs, reserve_size);
-    if (ret) {
-        AF_XDP_LOG(DEBUG, "Failed to get enough buffers for fq.\n");
-        goto err;
-    }
-#endif
-
-    if (rxq->busy_budget) {
-        ret = configure_preferred_busy_poll(rxq);
-        if (ret) {
-            AF_XDP_LOG(ERR, "Failed configure busy polling.\n");
+            MINI_XDP_LOG(ERR, "Failed to insert xsk in map.\n");
             goto err;
         }
     }
@@ -1231,7 +775,7 @@ xsk_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq,
     ret = reserve_fill_queue(rxq->umem, reserve_size, fq_bufs, &rxq->fq);
     if (ret) {
         xsk_socket__delete(rxq->xsk);
-        AF_XDP_LOG(ERR, "Failed to reserve fill queue.\n");
+        MINI_XDP_LOG(ERR, "Failed to reserve fill queue.\n");
         goto err;
     }
 
@@ -1244,6 +788,7 @@ xsk_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq,
     return ret;
 }
 
+// 设置接收队列
 static int
 eth_rx_queue_setup(struct rte_eth_dev *dev,
                    uint16_t rx_queue_id,
@@ -1255,37 +800,20 @@ eth_rx_queue_setup(struct rte_eth_dev *dev,
     struct pkt_rx_queue *rxq;
     int ret;
 
+    // 获取父接口的队列ID
+    //  这里保证队列一定只有0号
     rxq = &internals->rx_queues[rx_queue_id];
 
-    AF_XDP_LOG(INFO, "Set up rx queue, rx queue id: %d, xsk queue id: %d\n",
-               rx_queue_id, rxq->xsk_queue_idx);
-
-#ifndef XDP_UMEM_UNALIGNED_CHUNK_FLAG
-    uint32_t buf_size, data_size;
-
-    /* Now get the space available for data in the mbuf */
-    buf_size = rte_pktmbuf_data_room_size(mb_pool) -
-               RTE_PKTMBUF_HEADROOM;
-    data_size = ETH_AF_XDP_FRAME_SIZE;
-
-    if (data_size > buf_size) {
-        AF_XDP_LOG(ERR, "%s: %d bytes will not fit in mbuf (%d bytes)\n",
-                   dev->device->name, data_size, buf_size);
-        ret = -ENOMEM;
-        goto err;
-    }
-#endif
+    MINI_XDP_LOG(INFO, "Set up rx queue, rx queue id: %d, xsk queue id: %d\n",
+                 rx_queue_id, rxq->xsk_queue_idx);
 
     rxq->mb_pool = mb_pool;
 
     if (xsk_configure(internals, rxq, nb_rx_desc)) {
-        AF_XDP_LOG(ERR, "Failed to configure xdp socket\n");
+        MINI_XDP_LOG(ERR, "Failed to configure xdp socket\n");
         ret = -EINVAL;
         goto err;
     }
-
-    if (!rxq->busy_budget)
-        AF_XDP_LOG(DEBUG, "Preferred busy polling not enabled\n");
 
     rxq->fds[0].fd = xsk_socket__fd(rxq->xsk);
     rxq->fds[0].events = POLLIN;
@@ -1297,6 +825,7 @@ eth_rx_queue_setup(struct rte_eth_dev *dev,
     return ret;
 }
 
+// 设置发送流程
 static int
 eth_tx_queue_setup(struct rte_eth_dev *dev,
                    uint16_t tx_queue_id,
@@ -1306,26 +835,28 @@ eth_tx_queue_setup(struct rte_eth_dev *dev,
     struct pmd_internals *internals = dev->data->dev_private;
     struct pkt_tx_queue *txq;
 
+    // tx_queue_id 一定只有0
     txq = &internals->tx_queues[tx_queue_id];
 
     dev->data->tx_queues[tx_queue_id] = txq;
     return 0;
 }
 
+// 设置接口的MTU
+//  虽然是面向XDP的vdev设置的，但是实际上是对父接口生效
 static int
 eth_dev_mtu_set(struct rte_eth_dev *dev, uint16_t mtu) {
     struct pmd_internals *internals = dev->data->dev_private;
     struct ifreq ifr = {.ifr_mtu = mtu};
     int ret;
-    int s;
 
-    s = socket(PF_INET, SOCK_DGRAM, 0);
-    if (s < 0)
+    int fd = socket(PF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
         return -EINVAL;
 
     strlcpy(ifr.ifr_name, internals->if_name, IFNAMSIZ);
-    ret = ioctl(s, SIOCSIFMTU, &ifr);
-    close(s);
+    ret = ioctl(fd, SIOCSIFMTU, &ifr);
+    close(fd);
 
     return (ret < 0) ? -errno : 0;
 }
@@ -1356,6 +887,7 @@ eth_dev_change_flags(char *if_name, uint32_t flags, uint32_t mask) {
     return ret;
 }
 
+// 启用混杂模式
 static int
 eth_dev_promiscuous_enable(struct rte_eth_dev *dev) {
     struct pmd_internals *internals = dev->data->dev_private;
@@ -1363,6 +895,7 @@ eth_dev_promiscuous_enable(struct rte_eth_dev *dev) {
     return eth_dev_change_flags(internals->if_name, IFF_PROMISC, ~0);
 }
 
+// 关闭混杂模式
 static int
 eth_dev_promiscuous_disable(struct rte_eth_dev *dev) {
     struct pmd_internals *internals = dev->data->dev_private;
@@ -1370,6 +903,7 @@ eth_dev_promiscuous_disable(struct rte_eth_dev *dev) {
     return eth_dev_change_flags(internals->if_name, 0, ~IFF_PROMISC);
 }
 
+// 注册到init_internals函数，vdev创建时会带上这些ops
 static const struct eth_dev_ops ops = {
         .dev_start = eth_dev_start,
         .dev_stop = eth_dev_stop,
@@ -1605,9 +1139,7 @@ parse_parameters(struct rte_kvargs *kvlist, char *if_name, char *prog_path) {
  */
 
 static struct rte_eth_dev *
-init_internals(struct rte_vdev_device *dev, const char *if_name,
-               int start_queue_idx, int queue_cnt, int shared_umem,
-               const char *prog_path) {
+init_internals(struct rte_vdev_device *dev, const char *if_name, const char *prog_path) {
     const char *name = rte_vdev_device_name(dev);
     const unsigned int numa_node = dev->device.numa_node;
     struct pmd_internals *internals;
@@ -1715,21 +1247,22 @@ init_internals(struct rte_vdev_device *dev, const char *if_name,
 
 // 初始化驱动接口
 static int
-rte_pmd_af_xdp_probe(struct rte_vdev_device *dev) {
+rte_pmd_mini_xdp_probe(struct rte_vdev_device *dev) {
     struct rte_kvargs *kvlist;
     char if_name[IFNAMSIZ] = {'\0'};
     char prog_path[PATH_MAX] = {'\0'};
-    int busy_budget = -1;
     struct rte_eth_dev *eth_dev = NULL;
     const char *name = rte_vdev_device_name(dev);
 
-    MINI_XDP_LOG(INFO, "Initializing pmd_mini_xdp for %s\n",
+    MINI_XDP_LOG(RTE_LOG_INFO,
+                 "Initializing pmd_mini_xdp for %s\n",
                  name);
 
     // 不允许启动第二个实例
     // miniXDP单队列，没有并行的意义
     if (rte_eal_process_type() == RTE_PROC_SECONDARY) {
-        MINI_XDP_LOG(ERR, "Failed to probe %s. MINI_XDP PMD does not support secondary processes.\n",
+        MINI_XDP_LOG(RTE_LOG_ERR,
+                     "Failed to probe %s. MINI_XDP PMD does not support secondary processes.\n",
                      name);
         return -ENOTSUP;
     }
@@ -1737,7 +1270,8 @@ rte_pmd_af_xdp_probe(struct rte_vdev_device *dev) {
     // 解析参数
     kvlist = rte_kvargs_parse(rte_vdev_device_args(dev), valid_arguments);
     if (kvlist == NULL) {
-        MINI_XDP_LOG(ERR, "Invalid kvargs key\n");
+        MINI_XDP_LOG(RTE_LOG_ERR,
+                     "Invalid kvargs key\n");
         return -EINVAL;
     }
 
@@ -1745,34 +1279,40 @@ rte_pmd_af_xdp_probe(struct rte_vdev_device *dev) {
     if (dev->device.numa_node == SOCKET_ID_ANY)
         dev->device.numa_node = rte_socket_id();
 
+    // 解析参数
     if (parse_parameters(kvlist, if_name, prog_path) < 0) {
-        MINI_XDP_LOG(ERR, "Invalid kvargs value\n");
+        MINI_XDP_LOG(RTE_LOG_ERR,
+                     "Invalid kvargs value\n");
         return -EINVAL;
     }
 
     if (strlen(if_name) == 0) {
-        MINI_XDP_LOG(ERR, "Network interface must be specified\n");
+        MINI_XDP_LOG(RTE_LOG_ERR,
+                     "Network interface must be specified\n");
         return -EINVAL;
     }
 
-    eth_dev = init_internals(dev, if_name, xsk_start_queue_idx,
-                             xsk_queue_cnt, shared_umem, prog_path);
+    // 生成vdev设备
+    eth_dev = init_internals(dev, if_name, prog_path);
     if (eth_dev == NULL) {
-        AF_XDP_LOG(ERR, "Failed to init internals\n");
+        MINI_XDP_LOG(RTE_LOG_ERR,
+                     "Failed to init device internals\n");
         return -1;
     }
 
+    // 收尾操作
     rte_eth_dev_probing_finish(eth_dev);
 
     return 0;
 }
 
+// 移除驱动接口
 static int
-rte_pmd_af_xdp_remove(struct rte_vdev_device *dev) {
+rte_pmd_mini_xdp_remove(struct rte_vdev_device *dev) {
     struct rte_eth_dev *eth_dev = NULL;
 
-    AF_XDP_LOG(INFO, "Removing AF_XDP ethdev on numa socket %u\n",
-               rte_socket_id());
+    MINI_XDP_LOG(INFO, "Removing MINI_XDP ethdev on numa socket %u\n",
+                 rte_socket_id());
 
     if (dev == NULL)
         return -1;
@@ -1785,18 +1325,14 @@ rte_pmd_af_xdp_remove(struct rte_vdev_device *dev) {
     eth_dev_close(eth_dev);
     rte_eth_dev_release_port(eth_dev);
 
-
     return 0;
 }
 
 static struct rte_vdev_driver pmd_mini_xdp_drv = {
-        .probe = rte_pmd_af_xdp_probe,
-        .remove = rte_pmd_af_xdp_remove,
+        .probe = rte_pmd_mini_xdp_probe,
+        .remove = rte_pmd_mini_xdp_remove,
 };
-
 RTE_PMD_REGISTER_VDEV(net_mini_xdp, pmd_mini_xdp_drv
 );
-
 RTE_PMD_REGISTER_PARAM_STRING(net_mini_xdp,
-"iface=<string> "
-"xdp_prog=<string> ");
+"iface=<string> xdp_prog=<string> ");

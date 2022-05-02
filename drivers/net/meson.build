@@ -35,6 +35,7 @@ drivers = [
         'kni',
         'liquidio',
         'memif',
+        'minixdp',
         'mlx4',
         'mlx5',
         'mvneta',
