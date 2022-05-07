@@ -1,7 +1,9 @@
 #include "header.h"
 
 struct pmd_internals {
+    // 父接口的ID
     int if_index;
+    // 父接口名
     char if_name[IFNAMSIZ];
 
     // eBPF程序部分
@@ -31,15 +33,16 @@ struct xsk_umem_info {
     struct rte_mempool *mb_pool;
     void *buffer;
     uint8_t refcnt;
-    uint32_t max_xsks;
 };
 
+// Rx队列计数器
 struct rx_stats {
     uint64_t rx_pkts;
     uint64_t rx_bytes;
     uint64_t rx_dropped;
 };
 
+// Rx队列配置
 struct pkt_rx_queue {
     struct xsk_ring_cons rx;
     struct xsk_umem_info *umem;
@@ -54,15 +57,16 @@ struct pkt_rx_queue {
     struct pkt_tx_queue *pair;
     struct pollfd fds[1];
     int xsk_queue_idx;
-    int busy_budget;
 };
 
+// Tx队列计数器
 struct tx_stats {
     uint64_t tx_pkts;
     uint64_t tx_bytes;
     uint64_t tx_dropped;
 };
 
+// Tx队列配置
 struct pkt_tx_queue {
     struct xsk_ring_prod tx;
     struct xsk_umem_info *umem;
@@ -77,7 +81,7 @@ static const struct rte_eth_link pmd_link = {
         .link_speed = RTE_ETH_SPEED_NUM_10G,
         .link_duplex = RTE_ETH_LINK_FULL_DUPLEX,
         .link_status = RTE_ETH_LINK_DOWN,
-        .link_autoneg = RTE_ETH_LINK_AUTONEG
+        .link_autoneg = RTE_ETH_LINK_AUTONEG,
 };
 
 static inline int
@@ -123,6 +127,7 @@ af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
     uint32_t free_thresh = fq->size >> 1;
     struct rte_mbuf *mbufs[ETH_AF_XDP_RX_BATCH_SIZE];
 
+    // prod队列不能空，不然会出现死锁，所以在消费前必须判断一下是否为空的，空了就要放desc
     if (xsk_prod_nb_free(fq, free_thresh) >= free_thresh)
         (void) reserve_fill_queue(umem, nb_pkts, NULL, fq);
 
@@ -135,6 +140,7 @@ af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
         return 0;
     }
 
+    // 为传入的mbuf准备
     if (unlikely(rte_pktmbuf_alloc_bulk(rxq->mb_pool, mbufs, nb_pkts))) {
         /* rollback cached_cons which is added by
          * xsk_ring_cons__peek
@@ -154,8 +160,7 @@ af_xdp_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
         len = desc->len;
         pkt = xsk_umem__get_data(rxq->umem->mz->addr, addr);
 
-        rte_memcpy(rte_pktmbuf_mtod(mbufs[i],
-        void *), pkt, len);
+        rte_memcpy(rte_pktmbuf_mtod(mbufs[i], void *), pkt, len);
         rte_ring_enqueue(umem->buf_ring, (void *) addr);
         rte_pktmbuf_pkt_len(mbufs[i]) = len;
         rte_pktmbuf_data_len(mbufs[i]) = len;
@@ -267,10 +272,8 @@ af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
         desc->len = mbuf->pkt_len;
 
         desc->addr = (uint64_t) addrs[i];
-        pkt = xsk_umem__get_data(umem->mz->addr,
-                                 desc->addr);
-        rte_memcpy(pkt, rte_pktmbuf_mtod(mbuf,
-        void *), desc->len);
+        pkt = xsk_umem__get_data(umem->mz->addr, desc->addr);
+        rte_memcpy(pkt, rte_pktmbuf_mtod(mbuf, void *), desc->len);
         tx_bytes += mbuf->pkt_len;
         rte_pktmbuf_free(mbuf);
     }
@@ -286,7 +289,7 @@ af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
 }
 
 static uint16_t
-af_xdp_tx_batch(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
+eth_af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
     uint16_t nb_tx;
 
     if (likely(nb_pkts <= ETH_AF_XDP_TX_BATCH_SIZE))
@@ -310,12 +313,6 @@ af_xdp_tx_batch(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
     return nb_tx;
 }
 
-static uint16_t
-eth_af_xdp_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts) {
-    return af_xdp_tx_batch(queue, bufs, nb_pkts);
-}
-
-// vdev的ops，设置接口打开
 static int
 eth_dev_start(struct rte_eth_dev *dev) {
     dev->data->dev_link.link_status = RTE_ETH_LINK_UP;
@@ -323,7 +320,6 @@ eth_dev_start(struct rte_eth_dev *dev) {
     return 0;
 }
 
-// vdev的ops，设置接口关闭
 static int
 eth_dev_stop(struct rte_eth_dev *dev) {
     dev->data->dev_link.link_status = RTE_ETH_LINK_DOWN;
@@ -331,11 +327,8 @@ eth_dev_stop(struct rte_eth_dev *dev) {
     return 0;
 }
 
-// 接口配置
 static int
 eth_dev_configure(struct rte_eth_dev *dev) {
-    struct pmd_internals *internal = dev->data->dev_private;
-
     /* rx/tx must be paired */
     if (dev->data->nb_rx_queues != dev->data->nb_tx_queues)
         return -EINVAL;
@@ -448,6 +441,7 @@ static int
 eth_stats_reset(struct rte_eth_dev *dev) {
     struct pmd_internals *internals = dev->data->dev_private;
 
+    // 只有一个队列
     memset(&internals->rx_queues[0].stats, 0, sizeof(struct rx_stats));
     memset(&internals->tx_queues[0].stats, 0, sizeof(struct tx_stats));
 
@@ -484,7 +478,6 @@ static int
 eth_dev_close(struct rte_eth_dev *dev) {
     struct pmd_internals *internals = dev->data->dev_private;
     struct pkt_rx_queue *rxq;
-    int i;
 
     // 只处理主线程，因为不会有第二个，因此其他线程的就不再处理
     if (rte_eal_process_type() != RTE_PROC_PRIMARY)
@@ -529,9 +522,6 @@ eth_link_update(struct rte_eth_dev *dev __rte_unused,
     return 0;
 }
 
-// UMEM配置
-//  去掉了原版的XDP_UMEM_UNALIGNED_CHUNK_FLAG支持
-//  TODO: 研究一下内存结构
 static struct xsk_umem_info *
 xdp_umem_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq) {
     struct xsk_umem_info *umem;
@@ -552,7 +542,6 @@ xdp_umem_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq) {
         return NULL;
     }
 
-    // 创建ringbuff
     snprintf(ring_name, sizeof(ring_name), "mini_xdp_ring_%s_%u",
              internals->if_name, rxq->xsk_queue_idx);
     umem->buf_ring = rte_ring_create(ring_name,
@@ -564,7 +553,6 @@ xdp_umem_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq) {
         goto err;
     }
 
-    // 入队
     for (i = 0; i < ETH_AF_XDP_NUM_BUFFERS; i++)
         rte_ring_enqueue(umem->buf_ring,
                          (void *) (i * ETH_AF_XDP_FRAME_SIZE));
@@ -598,9 +586,6 @@ xdp_umem_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq) {
     return NULL;
 };
 
-/*
- * 加载eBPF XDP程序
- */
 static int
 load_xdp_prog(struct pmd_internals *internals) {
     struct bpf_object *obj;
@@ -654,8 +639,6 @@ load_xdp_prog(struct pmd_internals *internals) {
     return 0;
 };
 
-// 配置XDP xsk
-//  TODO: 看一下逻辑
 static int
 xsk_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq, int ring_size) {
     struct xsk_socket_config cfg;
@@ -676,7 +659,7 @@ xsk_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq, int rin
     cfg.bind_flags = 0;
 
 #if defined(XDP_USE_NEED_WAKEUP)
-    // 保留此flag
+    // 可以设置唤醒模式，省掉busy poll的CPU消耗
     cfg.bind_flags |= XDP_USE_NEED_WAKEUP;
 #endif
 
@@ -730,7 +713,6 @@ xsk_configure(struct pmd_internals *internals, struct pkt_rx_queue *rxq, int rin
     return ret;
 }
 
-// 设置接收队列
 static int
 eth_rx_queue_setup(struct rte_eth_dev *dev,
                    uint16_t rx_queue_id,
@@ -742,7 +724,15 @@ eth_rx_queue_setup(struct rte_eth_dev *dev,
     struct pkt_rx_queue *rxq;
     int ret;
 
-    // 获取父接口的队列ID
+    // 只支持单队列，队列ID仅会为0
+    if (rx_queue_id != 0) {
+        MINI_XDP_LOG(ERR,
+                     "Set up rx queue failed: id %d is not 0\n", rx_queue_id);
+        ret = -EINVAL;
+        goto err;
+    }
+
+    // 获取父接口的rx队列
     //  这里保证队列一定只有0号
     rxq = &internals->rx_queues[rx_queue_id];
 
@@ -776,6 +766,13 @@ eth_tx_queue_setup(struct rte_eth_dev *dev,
                    const struct rte_eth_txconf *tx_conf __rte_unused) {
     struct pmd_internals *internals = dev->data->dev_private;
     struct pkt_tx_queue *txq;
+
+    // 只支持单队列，队列ID仅会为0
+    if (tx_queue_id != 0) {
+        MINI_XDP_LOG(ERR,
+                     "Set up tx queue failed: id %d is not 0\n", tx_queue_id);
+        return -EINVAL;
+    }
 
     // tx_queue_id 一定只有0
     txq = &internals->tx_queues[tx_queue_id];
@@ -988,10 +985,6 @@ get_iface_info(const char *if_name,
     return -1;
 }
 
-/* 下边是参数解析
- *
- */
-
 #define ETH_MINI_XDP_IFACE_ARG "iface"
 #define ETH_MINI_XDP_PROG_ARG  "xdp_prog"
 
@@ -1057,7 +1050,6 @@ parse_prog_arg(const char *key __rte_unused,
     return 0;
 }
 
-
 // 解析EAL参数
 static int
 parse_parameters(struct rte_kvargs *kvlist, char *if_name, char *prog_path) {
@@ -1076,10 +1068,6 @@ parse_parameters(struct rte_kvargs *kvlist, char *if_name, char *prog_path) {
     return ret;
 }
 
-/* =========================================================================
- * 下边是probe相关
- */
-
 static struct rte_eth_dev *
 init_internals(struct rte_vdev_device *dev, const char *if_name, const char *prog_path) {
     const char *name = rte_vdev_device_name(dev);
@@ -1087,10 +1075,8 @@ init_internals(struct rte_vdev_device *dev, const char *if_name, const char *pro
     struct pmd_internals *internals;
     struct rte_eth_dev *eth_dev;
     int ret;
-    int i;
 
     // 在指定NUMA node上分配内存
-    // 都已经细节到这程度了吗...
     internals = rte_zmalloc_socket(name, sizeof(struct pmd_internals), 0, numa_node);
     if (internals == NULL)
         return NULL;
@@ -1151,8 +1137,6 @@ init_internals(struct rte_vdev_device *dev, const char *if_name, const char *pro
     // 由于队列均只有一个，因xsk绑定队列都设置成0（首个队列）
     internals->rx_queues[0].xsk_queue_idx = 0;
     internals->tx_queues[0].xsk_queue_idx = 0;
-    // 不要开忙轮询，否则内核要在5.11以上
-    internals->rx_queues[0].busy_budget = 0;
 
     ret = get_iface_info(if_name, &internals->eth_addr,
                          &internals->if_index);
@@ -1171,9 +1155,10 @@ init_internals(struct rte_vdev_device *dev, const char *if_name, const char *pro
     eth_dev->data->mac_addrs = &internals->eth_addr;
     eth_dev->data->dev_flags |= RTE_ETH_DEV_AUTOFILL_QUEUE_XSTATS;
     // 设置handle
-    // TODO: 改这里
     eth_dev->dev_ops = &ops;
+    // 注册收包句柄
     eth_dev->rx_pkt_burst = eth_af_xdp_rx;
+    // 注册发包句柄
     eth_dev->tx_pkt_burst = eth_af_xdp_tx;
 
     return eth_dev;
@@ -1274,7 +1259,5 @@ static struct rte_vdev_driver pmd_mini_xdp_drv = {
         .probe = rte_pmd_mini_xdp_probe,
         .remove = rte_pmd_mini_xdp_remove,
 };
-RTE_PMD_REGISTER_VDEV(net_mini_xdp, pmd_mini_xdp_drv
-);
-RTE_PMD_REGISTER_PARAM_STRING(net_mini_xdp,
-"iface=<string> xdp_prog=<string> ");
+RTE_PMD_REGISTER_VDEV(net_mini_xdp, pmd_mini_xdp_drv);
+RTE_PMD_REGISTER_PARAM_STRING(net_mini_xdp, "iface=<string> xdp_prog=<string> ");

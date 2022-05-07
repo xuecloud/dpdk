@@ -63,7 +63,7 @@ build-job:
     - dnf groupinstall "Development Tools" -y
     - dnf install unzip vim curl wget -y
     - dnf install meson python3-pyelftools python3-pip numactl-devel libbpf-devel libpcap-devel openssl-devel -y
-    - pip3 install ninja
+    - pip3 install -i https://pypi.tuna.tsinghua.edu.cn/simple ninja
 
     # 构建
     - meson build

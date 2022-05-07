@@ -46,10 +46,10 @@
 #ifndef SO_PREFER_BUSY_POLL
 #define SO_PREFER_BUSY_POLL 69
 #endif
+
 #ifndef SO_BUSY_POLL_BUDGET
 #define SO_BUSY_POLL_BUDGET 70
 #endif
-
 
 #ifndef SOL_XDP
 #define SOL_XDP 283
@@ -71,19 +71,16 @@ RTE_LOG_REGISTER_DEFAULT(mini_xdp_logtype, NOTICE);
 
 // XDP每帧空间
 #define ETH_AF_XDP_FRAME_SIZE        2048
-// Ringbuff分配数量，对齐desc的两倍即可
+
+// UMEM MemZone分配数量，建议对齐Desc的两倍甚至更多
 #define ETH_AF_XDP_NUM_BUFFERS        ETH_AF_XDP_DFLT_NUM_DESCS * 2
 
-// 默认的XDP desc数量，默认为2048
-//  此大小目前用于Rxq Txq，以及Fill和Complete Ring
+// 默认的XDP desc数量，默认2048
 #define ETH_AF_XDP_DFLT_NUM_DESCS    XSK_RING_CONS__DEFAULT_NUM_DESCS
-
-#define ETH_AF_XDP_DFLT_QUEUE_COUNT    1
-#define ETH_AF_XDP_DFLT_BUSY_BUDGET    64
-#define ETH_AF_XDP_DFLT_BUSY_TIMEOUT    20
 
 #define ETH_MINI_XDP_DFLT_BURST_SIZE 64
 
+// 批量收发的最大大小
 #define ETH_AF_XDP_RX_BATCH_SIZE    XSK_RING_CONS__DEFAULT_NUM_DESCS
 #define ETH_AF_XDP_TX_BATCH_SIZE    XSK_RING_CONS__DEFAULT_NUM_DESCS
 
