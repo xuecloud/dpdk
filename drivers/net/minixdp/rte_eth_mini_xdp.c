@@ -886,7 +886,6 @@ xdp_get_channels_info(const char *if_name,
     strlcpy(ifr.ifr_name, if_name, IFNAMSIZ);
     ret = ioctl(fd, SIOCETHTOOL, &ifr);
     if (ret) {
-        // 如果不支持的话继续，认为是单队列
         if (errno == EOPNOTSUPP) {
             ret = 0;
         } else {
@@ -895,6 +894,8 @@ xdp_get_channels_info(const char *if_name,
         }
     }
 
+    // TODO: 长期要观察一下，不确定不同驱动识别出来的会不会有什么问题
+    // 如果设备返回没队列，或者不支持，那就手工修复一下
     if (channels.max_combined == 0 || errno == EOPNOTSUPP) {
         /* If the device says it has no channels, then all traffic
          * is sent to a single stream, so max queues = 1.
@@ -909,6 +910,13 @@ xdp_get_channels_info(const char *if_name,
         *tx_queues = channels.tx_count;
         *rx_queues = channels.rx_count;
     }
+
+    // rx或者tx为N/A时，表示驱动并不支持多队列，返回值会是0，要手工修正一下
+    if (channels.tx_count == 0)
+        *tx_queues = 1;
+
+    if (channels.rx_count == 0)
+        *rx_queues = 1;
 
     out:
     close(fd);
@@ -1092,21 +1100,18 @@ init_internals(struct rte_vdev_device *dev, const char *if_name, const char *pro
 
     // 获取通道信息
     ret = xdp_get_channels_info(if_name, &max_queue_count, &combined_queue_count, &tx_queues, &rx_queues);
-    // 如果不支持的话，则认为是单通道，可以正常运行
-    if (ret == -EOPNOTSUPP) {
-        MINI_XDP_LOG(INFO, "Device not support channels: %s\n", if_name);
-        tx_queues = 1;
-        rx_queues = 1;
-    } else if (ret) {
+    if (ret) {
         MINI_XDP_LOG(ERR, "Failed to get channel info of interface: %s\n", if_name);
         goto err_free_internals;
     }
+
+    MINI_XDP_LOG(INFO, "Device reported %s channels: rx: %d, tx: %d\n", if_name, rx_queues, tx_queues);
 
     // 如果不是单通道（仅限Txq和Rxq）的话就设置一下
     if (tx_queues != 1 || rx_queues != 1) {
         ret = xdp_set_channels_info(if_name, 1, 1);
         if (ret) {
-            MINI_XDP_LOG(ERR, "Device can not set to valid queue count: %s\n", if_name);
+            MINI_XDP_LOG(ERR, "Device can not set to valid queue count: %s, tx: %d, rx: %d\n", if_name, tx_queues, rx_queues);
             goto err_free_internals;
         }
     }
@@ -1255,9 +1260,9 @@ rte_pmd_mini_xdp_remove(struct rte_vdev_device *dev) {
     return 0;
 }
 
-static struct rte_vdev_driver pmd_mini_xdp_drv = {
+static struct rte_vdev_driver pmd_minixdp_drv = {
         .probe = rte_pmd_mini_xdp_probe,
         .remove = rte_pmd_mini_xdp_remove,
 };
-RTE_PMD_REGISTER_VDEV(net_mini_xdp, pmd_mini_xdp_drv);
-RTE_PMD_REGISTER_PARAM_STRING(net_mini_xdp, "iface=<string> xdp_prog=<string> ");
+RTE_PMD_REGISTER_VDEV(net_minixdp, pmd_minixdp_drv);
+RTE_PMD_REGISTER_PARAM_STRING(net_minixdp, "iface=<string> xdp_prog=<string> ");
