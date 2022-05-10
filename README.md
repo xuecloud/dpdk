@@ -113,6 +113,31 @@ sudo ./examples/dpdk-l2fwd --vdev net_minixdp0,iface=ens1f2,xdp_prog=/home/xuega
 |------|----------------------------------------------------------------------------|
 | -p 3 | 端口掩码（port mask），用于标识启动哪些接口，因为vdev接口默认可能是关闭的。此处的`3`二进制即为`0000 0011`，即开启两个端口 |
 
+## 编译
+
+### 所需依赖
+
+操作系统建议Fedora 34。
+
+安装依赖：
+
+```bash
+dnf groupinstall "Development Tools" -y
+dnf install unzip vim curl wget -y
+dnf install meson python3-pyelftools python3-pip numactl-devel libbpf-devel libpcap-devel openssl-devel -y
+pip3 install -i https://pypi.tuna.tsinghua.edu.cn/simple ninja
+```
+
+### 编译参数
+
+编译需要加参数，禁用掉不必要的驱动和库，可以大幅缩小二进制文件体积。完整编译驱动，二进制文件体积大概在28M左右，禁用不必要的东西后，可以缩小到3M左右。
+
+```bash
+meson build -Dexamples=l2fwd -Dplatform=generic -Denable_drivers=net/minixdp,mempool/bucket,mempool/ring,mempool/stack -Ddisable_libs=gpudev,power,vhost -Dmax_lcores=8 -Dtests=false
+cd build
+ninja
+```
+
 ## 名次释义
 
 此处对文中出现的一些自造词进行解释。
