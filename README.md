@@ -115,6 +115,8 @@ sudo ./examples/dpdk-l2fwd --vdev net_minixdp0,iface=ens1f2,xdp_prog=/home/xuega
 
 ## 编译
 
+详细的编译流程可以参考流水线文件。分别在`.gitlab-ci.yml`和`buildtools/builder`中。
+
 ### 所需依赖
 
 操作系统建议Fedora 34。
