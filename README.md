@@ -117,17 +117,28 @@ sudo ./examples/dpdk-l2fwd --vdev net_minixdp0,iface=ens1f2,xdp_prog=/home/xuega
 
 详细的编译流程可以参考流水线文件。分别在`.gitlab-ci.yml`和`buildtools/builder`中。
 
-### 所需依赖
+### ABI兼容性
 
-操作系统建议Fedora 34。
+GLIBC存在ABI兼容性问题，其他库大多数都可以进行静态链接。对于GLIBC，为了保证兼容性，按照社区经验，尽可能用老版本的GLIBC编译。
+
+> In general, running binaries that were compiled for an older glibc version (e.g. 2.13) will run fine on a system with a newer glibc (e.g. 2.14, like your system).
+>
+> Running a binary that was built for a newer glibc (e.g. 2.15, like the one that fails) on a system with an older glibc will probably not work.
+>
+> In short, glibc is backward-compatible, not forward-compatible.
+
+目前，已知Fedora 34环境的GLIBC 2.33版本与Rocky Linux 8的GLIBC 2.28无法兼容。OpenWRT 22.03 glibc库默认使用了2.34版本，此处为了兼容服务器端，尽可能在低版本环境上编译（Rocky Linux 8）。
+
+### 所需依赖
 
 安装依赖：
 
 ```bash
 dnf groupinstall "Development Tools" -y
-dnf install unzip vim curl wget -y
-dnf install meson python3-pyelftools python3-pip numactl-devel libbpf-devel libpcap-devel openssl-devel -y
-pip3 install -i https://pypi.tuna.tsinghua.edu.cn/simple ninja
+dnf install bash unzip vim curl wget -y
+dnf install epel-release -y
+dnf install --enablerepo=powertools meson python3-pyelftools python3-pip numactl-devel libbpf-devel libpcap-devel openssl-devel -y
+pip3 install ninja
 ```
 
 ### 编译参数
